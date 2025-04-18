@@ -18,20 +18,19 @@ import org.springframework.stereotype.Service;
 import org.stefanie.renlike.service.ThumbService;
 import org.stefanie.renlike.service.UserService;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
-* @author 张子涵
-* @description 针对表【blog】的数据库操作Service实现
-* @createDate 2025-04-17 16:01:44
-*/
+ * @author 张子涵
+ * @description 针对表【blog】的数据库操作Service实现
+ * @createDate 2025-04-17 16:01:44
+ */
 @Service
 public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog>
-    implements BlogService {
+        implements BlogService {
 
     @Resource
     private UserService userService;
@@ -39,6 +38,8 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog>
     @Resource
     @Lazy
     private ThumbService thumbService;
+    @Resource
+    private BlogService blogService;
     @Resource
     private RedisTemplate redisTemplate;
 
@@ -62,6 +63,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog>
 
         return blogVO;
     }
+
     @Override
     public List<BlogVO> getBlogVOList(List<Blog> blogList, HttpServletRequest request) {
         User loginUser = userService.getLoginUser(request);
@@ -85,6 +87,20 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog>
                     return blogVO;
                 })
                 .toList();
+    }
+
+    @Override
+    public Boolean isExpired(Long blogId) {
+        //先查询数据库，看博客发布时间是否超过一个月，超过一个月走数据库，不超过走redis
+        Blog queryBlog = blogService.getById(blogId);
+        Date blogCreateTime = queryBlog.getCreateTime();
+        LocalDateTime blogCreateTimeLocalDateTime = blogCreateTime.toInstant()  // 转为 Instant
+                .atZone(ZoneId.of("Asia/Shanghai"))  // 使用标准时区ID
+                .toLocalDateTime();  // 转为 LocalDateTime
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime blogPlusMonthDate = blogCreateTimeLocalDateTime.plusMonths(1);
+        return now.isAfter(blogPlusMonthDate);
+
     }
 
 }

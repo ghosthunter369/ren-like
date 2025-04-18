@@ -15,5 +15,6 @@ import java.util.List;
 public interface BlogService extends IService<Blog> {
     BlogVO getBlogVOById(long blogId, HttpServletRequest request);
     List<BlogVO> getBlogVOList(List<Blog> blogList, HttpServletRequest request);
+    Boolean isExpired(Long blogId);
 
 }
