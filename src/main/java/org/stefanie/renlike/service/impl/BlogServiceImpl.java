@@ -1,13 +1,24 @@
 package org.stefanie.renlike.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.ObjUtil;
+import cn.hutool.core.util.ObjectUtil;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpServletRequest;
+import org.apache.commons.lang3.ObjectUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.stefanie.renlike.constant.CommonConstant;
 import org.stefanie.renlike.constant.ThumbConstant;
+import org.stefanie.renlike.exception.BusinessException;
+import org.stefanie.renlike.exception.ErrorCode;
+import org.stefanie.renlike.exception.ThrowUtils;
+import org.stefanie.renlike.model.dto.post.BlogQueryRequest;
 import org.stefanie.renlike.model.entity.Blog;
 import org.stefanie.renlike.model.entity.Thumb;
 import org.stefanie.renlike.model.entity.User;
@@ -17,6 +28,7 @@ import org.stefanie.renlike.mapper.BlogMapper;
 import org.springframework.stereotype.Service;
 import org.stefanie.renlike.service.ThumbService;
 import org.stefanie.renlike.service.UserService;
+import org.stefanie.renlike.util.SqlUtils;
 
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -102,6 +114,79 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog>
         LocalDateTime blogPlusMonthDate = blogCreateTimeLocalDateTime.plusMonths(1);
         return now.isAfter(blogPlusMonthDate);
 
+    }
+
+    @Override
+    public void validBlog(Blog blog, boolean add) {
+        if (blog == null) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR);
+        }
+        Long userId = blog.getUserId();
+        String title = blog.getTitle();
+        String content = blog.getContent();
+        // 创建时，参数不能为空
+
+        if (!add) {
+            ThrowUtils.throwIf(StringUtils.isAnyBlank(title, content), ErrorCode.PARAMS_ERROR);
+        }
+        if(ObjectUtil.isNull(userId)){
+            throw new BusinessException(ErrorCode.PARAMS_ERROR);
+        }
+        // 有参数则校验
+        if (StringUtils.isNotBlank(title) && title.length() > 80) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "标题过长");
+        }
+        if (StringUtils.isNotBlank(content) && content.length() > 8192) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "内容过长");
+        }
+        if(add){
+           blogService.save(blog);
+        }
+    }
+
+    @Override
+    public QueryWrapper<Blog> getQueryWrapper(BlogQueryRequest blogQueryRequest) {
+        QueryWrapper<Blog> queryWrapper = new QueryWrapper<>();
+        if (blogQueryRequest == null) {
+            return queryWrapper;
+        }
+        Long id = blogQueryRequest.getId();
+        String searchText = blogQueryRequest.getSearchText();
+        String title = blogQueryRequest.getTitle();
+        String content = blogQueryRequest.getContent();
+        Long userId = blogQueryRequest.getUserId();
+        String sortField = blogQueryRequest.getSortField();
+        String sortOrder = blogQueryRequest.getSortOrder();
+        // 拼接查询条件
+        if (StringUtils.isNotBlank(searchText)) {
+            queryWrapper.and(qw -> qw.like("title", searchText).or().like("content", searchText));
+        }
+        queryWrapper.like(StringUtils.isNotBlank(title), "title", title);
+        queryWrapper.like(StringUtils.isNotBlank(content), "content", content);
+        queryWrapper.eq(ObjectUtils.isNotEmpty(id), "id", id);
+        queryWrapper.eq(ObjectUtils.isNotEmpty(userId), "userId", userId);
+        queryWrapper.orderBy(SqlUtils.validSortField(sortField), sortOrder.equals(CommonConstant.SORT_ORDER_ASC),
+                sortField);
+        return queryWrapper;
+    }
+
+
+    @Override
+    public BlogVO getBlogVO(Blog blog, HttpServletRequest request) {
+        BlogVO blogVO = new BlogVO();
+        BeanUtil.copyProperties(blog, blogVO);
+        return blogVO;
+    }
+
+    @Override
+    public Page<BlogVO> getBlogVOPage(Page<Blog> blogPage, HttpServletRequest request) {
+
+        return null;
+    }
+
+    @Override
+    public Page<BlogVO> listBlogVOByPage(BlogQueryRequest blogQueryRequest, HttpServletRequest request) {
+        return null;
     }
 
 }

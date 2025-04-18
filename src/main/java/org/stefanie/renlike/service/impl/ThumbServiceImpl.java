@@ -9,6 +9,7 @@ import org.redisson.api.RBloomFilter;
 import org.redisson.api.RLock;
 import org.redisson.api.RMap;
 import org.redisson.api.RedissonClient;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.stefanie.renlike.constant.BlogConstant;
@@ -42,6 +43,9 @@ public class ThumbServiceImpl extends ServiceImpl<ThumbMapper, Thumb> implements
     private final UserService userService;
 
     private final BlogService blogService;
+    @Resource
+    @Lazy
+    private ThumbService thumbService;
 
     private final TransactionTemplate transactionTemplate;
     private final RedisTemplate<String, Object> redisTemplate;
@@ -146,7 +150,87 @@ public class ThumbServiceImpl extends ServiceImpl<ThumbMapper, Thumb> implements
         }
         return isSuccess;
     }
+    private Boolean doThumbWithLockDelete(Long blogId, Long userId, boolean isNotHot) {
+        String lockKey = BlogConstant.BLOG_THUMB + blogId.toString();
+        boolean isLock = false;
+        boolean isSuccess = false;
+        RLock lock = redissonClient.getLock(lockKey);
+        if (!isNotHot) {
+            //走缓存
+            RMap<Object, Object> map = redissonClient.getMap(ThumbConstant.USER_THUMB_KEY_PREFIX + userId);
+            Long redisThumbId =(Long) map.get(blogId.toString());
+            if (redisThumbId == null) {
+                throw  new BusinessException(ErrorCode.PARAMS_ERROR, "您未点赞");
+            } else {
+                //查询数据库
+                try {
+                    isLock = lock.tryLock(10, 10, TimeUnit.SECONDS);
+                    if (!isLock) {
+                        throw new RuntimeException("加锁失败");
+                    }
+                    //加锁成功，处理点赞逻辑
+                    // 1. 更新数据库
+                    isSuccess = transactionTemplate.execute(status -> {
+                        //1.更新数据库，删除点赞记录
+                        Thumb thumb = this.lambdaQuery().eq(Thumb::getBlogId, blogId).eq(Thumb::getUserId, userId).one();
+                        // 2. 更新点赞数量
+                        boolean update = blogService.lambdaUpdate()
+                                .eq(Blog::getId, blogId)
+                                .setSql("thumbCount = thumbCount - 1")
+                                .update();
+                        boolean remove = this.removeById(thumb);
+                        //更新缓存
+                        map.remove(blogId.toString(), thumb.getId());
+                        return update && remove;
+                    });
+                    return isSuccess;
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                    throw new BusinessException(ErrorCode.OPERATION_ERROR, "操作失败");
+                } finally {
+                    if (lock.isHeldByCurrentThread()) {
+                        lock.unlock();
+                    }
+                }
 
+            }
+        }
+        //否则走数据库
+        // 冷数据走布隆过滤器 + 数据库
+        RBloomFilter<Object> bloomFilter = redissonClient.getBloomFilter(BlogConstant.BLOG_BLOOM_FILTER);
+        String bloomKey = blogId + ":" + userId;
+        boolean isContain = bloomFilter.contains(bloomKey);
+        if (!isContain) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "您未点赞");
+        }
+        try {
+            isLock = lock.tryLock(10, 10, TimeUnit.SECONDS);
+            if (!isLock) {
+                throw new RuntimeException("加锁失败");
+            }
+            //加锁成功，处理点赞逻辑
+            // 1. 更新数据库
+            isSuccess = transactionTemplate.execute(status -> {
+                Thumb thumb = this.lambdaQuery().eq(Thumb::getBlogId, blogId).eq(Thumb::getUserId, userId).one();
+                // 2. 更新点赞数量
+                boolean update = blogService.lambdaUpdate()
+                        .eq(Blog::getId, blogId)
+                        .setSql("thumbCount = thumbCount - 1")
+                        .update();
+                //加入布隆过滤器
+                bloomFilter.rename(bloomKey);
+                return update && this.removeById(thumb);
+            });
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "操作失败");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+        return isSuccess;
+    }
     @Override
     public Boolean undoThumb(DoThumbRequest doThumbRequest, HttpServletRequest request) {
         if (doThumbRequest == null || doThumbRequest.getBlogId() == null) {
@@ -154,30 +238,9 @@ public class ThumbServiceImpl extends ServiceImpl<ThumbMapper, Thumb> implements
         }
         User loginUser = userService.getLoginUser(request);
         // 加锁
-        synchronized (loginUser.getId().toString().intern()) {
-
-            // 编程式事务
-            return transactionTemplate.execute(status -> {
-                Long blogId = doThumbRequest.getBlogId();
-                Long thumbId = ((Long) redisTemplate.opsForHash().get(ThumbConstant.USER_THUMB_KEY_PREFIX + loginUser.getId().toString(), blogId.toString()));
-                if (thumbId == null) {
-                    throw new RuntimeException("用户未点赞");
-                }
-                boolean update = blogService.lambdaUpdate()
-                        .eq(Blog::getId, blogId)
-                        .setSql("thumbCount = thumbCount - 1")
-                        .update();
-
-                boolean success = update && this.removeById(thumbId);
-
-// 点赞记录从 Redis 删除
-                if (success) {
-                    redisTemplate.opsForHash().delete(ThumbConstant.USER_THUMB_KEY_PREFIX + loginUser.getId(), blogId.toString());
-                }
-                return success;
-
-            });
-        }
+        Long redisQueryKey = doThumbRequest.getBlogId();
+        Boolean expired = blogService.isExpired(redisQueryKey);
+        return doThumbWithLockDelete(redisQueryKey, loginUser.getId(), expired);
     }
 
 
