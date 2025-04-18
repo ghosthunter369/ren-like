@@ -1,0 +1,43 @@
+spring:
+  application.name: thumb-backend
+  data:
+    # Redis 配置
+    redis:
+      database: 10
+      host: 192.168.101.128
+      timeout: 5000
+      port: 6379
+  session:
+    # 30 天过期
+    timeout: 2592000
+    redis:
+      flush-mode: on_save
+      namespace: spring:session
+
+
+  mvc:
+    servlet:
+      path: /api
+
+  # DataSource Config
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/ren_like
+    username: root
+    password: 2771651667
+server:
+  port: 8900
+  servlet:
+    session:
+      cookie:
+        max-age: 2592000
+# knife4j
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+# mybatis-plus
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: false
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
