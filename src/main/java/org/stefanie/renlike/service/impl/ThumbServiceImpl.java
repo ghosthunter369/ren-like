@@ -1,12 +1,14 @@
 package org.stefanie.renlike.service.impl;
 
-import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.connection.ReturnType;
-import org.springframework.data.redis.core.RedisCallback;
+import org.redisson.api.RBloomFilter;
+import org.redisson.api.RLock;
+import org.redisson.api.RMap;
+import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.stefanie.renlike.constant.BlogConstant;
@@ -24,6 +26,7 @@ import org.stefanie.renlike.service.UserService;
 import org.stefanie.renlike.model.entity.Blog;
 import org.stefanie.renlike.util.RedisKeyUtil;
 
+import java.time.LocalDateTime;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -42,77 +45,106 @@ public class ThumbServiceImpl extends ServiceImpl<ThumbMapper, Thumb> implements
 
     private final TransactionTemplate transactionTemplate;
     private final RedisTemplate<String, Object> redisTemplate;
+    @Resource
+    private RedissonClient redissonClient;
+
     @Override
     public Boolean doThumb(DoThumbRequest doThumbRequest, HttpServletRequest request) {
         //校验参数
         if (doThumbRequest == null || doThumbRequest.getBlogId() == null) {
             throw new RuntimeException("参数错误");
         }
-        String lockKey = BlogConstant.BLOG_THUMB + doThumbRequest.getBlogId().toString();
-        //虎丘分布式锁
-        Boolean tryLock = redisTemplate.opsForValue().setIfAbsent(lockKey, doThumbRequest.getBlogId(), 10, TimeUnit.SECONDS);
-        try {
-            if(tryLock) {
-                Boolean expired = blogService.isExpired(doThumbRequest.getBlogId());
-                if (expired) {
+        User loginUser = userService.getLoginUser(request);
+        Long blogId = doThumbRequest.getBlogId();
+        Long userId = loginUser.getId();
+        //冷热分离，仅一个月的数据查询redis，否则查询数据库
+        Boolean expired = blogService.isExpired(blogId);
+        return doThumbWithLock(blogId, userId, expired);
+    }
 
-                    //走数据库
-                    return transactionTemplate.execute(status -> {
-                        User loginUser = userService.getLoginUser(request);
-                        Long blogId = doThumbRequest.getBlogId();
-                        //先更新博客点赞数
+    private Boolean doThumbWithLock(Long blogId, Long userId, boolean isNotHot) {
+        String lockKey = BlogConstant.BLOG_THUMB + blogId.toString();
+        boolean isLock = false;
+        boolean isSuccess = false;
+        RLock lock = redissonClient.getLock(lockKey);
+        if (!isNotHot) {
+            //走缓存
+            RMap<Object, Object> map = redissonClient.getMap(ThumbConstant.USER_THUMB_KEY_PREFIX + userId);
+            Long redisThumbId =(Long) map.get(blogId.toString());
+            if (redisThumbId != null) {
+              throw  new BusinessException(ErrorCode.PARAMS_ERROR, "您已经点赞过了");
+            } else {
+              //查询数据库
+                try {
+                    isLock = lock.tryLock(10, 10, TimeUnit.SECONDS);
+                    if (!isLock) {
+                        throw new RuntimeException("加锁失败");
+                    }
+                    //加锁成功，处理点赞逻辑
+                    // 1. 更新数据库
+                    isSuccess = transactionTemplate.execute(status -> {
+                        Thumb thumb = new Thumb();
+                        thumb.setBlogId(blogId);
+                        thumb.setUserId(userId);
+                        // 2. 更新点赞数量
                         boolean update = blogService.lambdaUpdate()
                                 .eq(Blog::getId, blogId)
                                 .setSql("thumbCount = thumbCount + 1")
                                 .update();
-                        //再插入点赞记录
-                        Thumb thumb = new Thumb();
-                        thumb.setBlogId(blogId);
-                        thumb.setUserId(loginUser.getId());
                         boolean save = this.save(thumb);
-                        //未过期才更新缓存
-
-                        return update && this.save(thumb);
+                        //更新缓存
+                        map.put(blogId.toString(), thumb.getId());
+                        return update && save;
                     });
+                    return isSuccess;
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                    throw new BusinessException(ErrorCode.OPERATION_ERROR, "操作失败");
+                } finally {
+                    if (lock.isHeldByCurrentThread()) {
+                        lock.unlock();
+                    }
                 }
 
-                // 加锁
-                // 编程式事务
-                return transactionTemplate.execute(status -> {
-                    Long blogId = doThumbRequest.getBlogId();
-                    User loginUser = userService.getLoginUser(request);
-                    Boolean exists = this.hasThumb(blogId, loginUser.getId());
-                    if (exists) {
-                        throw new BusinessException(ErrorCode.OPERATION_ERROR, "用户已点赞");
-                    }
-                    boolean update = blogService.lambdaUpdate()
-                            .eq(Blog::getId, blogId)
-                            .setSql("thumbCount = thumbCount + 1")
-                            .update();
-
-                    Thumb thumb = new Thumb();
-                    thumb.setUserId(loginUser.getId());
-                    thumb.setBlogId(blogId);
-                    // 更新成功才执行
-                    boolean success = update && this.save(thumb);
-                    // 点赞记录存入 Redis
-                    if (success) {
-                        redisTemplate.opsForHash().put(ThumbConstant.USER_THUMB_KEY_PREFIX + loginUser.getId().toString(), blogId.toString(), thumb.getId());
-                    }
-                    // 更新成功才执行
-                    return success;
-                });
-
             }
-        }finally {
-            //有锁才会释放锁
-            if(tryLock){
-                unLock(lockKey, String.valueOf(doThumbRequest.getBlogId()));
-            }
-
         }
-        return false;
-
+        //否则走数据库
+        // 冷数据走布隆过滤器 + 数据库
+        RBloomFilter<Object> bloomFilter = redissonClient.getBloomFilter(BlogConstant.BLOG_BLOOM_FILTER);
+        String bloomKey = blogId + ":" + userId;
+        boolean isContain = bloomFilter.contains(bloomKey);
+        if (isContain) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "您已经点赞过了");
+        }
+        try {
+            isLock = lock.tryLock(10, 10, TimeUnit.SECONDS);
+            if (!isLock) {
+                throw new RuntimeException("加锁失败");
+            }
+            //加锁成功，处理点赞逻辑
+            // 1. 更新数据库
+            isSuccess = transactionTemplate.execute(status -> {
+                Thumb thumb = new Thumb();
+                thumb.setBlogId(blogId);
+                thumb.setUserId(userId);
+                // 2. 更新点赞数量
+                boolean update = blogService.lambdaUpdate()
+                        .eq(Blog::getId, blogId)
+                        .setSql("thumbCount = thumbCount + 1")
+                        .update();
+                //加入布隆过滤器
+                bloomFilter.add(bloomKey);
+                return update && this.save(thumb);
+            });
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "操作失败");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+        return isSuccess;
     }
 
     @Override
@@ -149,21 +181,9 @@ public class ThumbServiceImpl extends ServiceImpl<ThumbMapper, Thumb> implements
     }
 
 
-
     @Override
     public Boolean hasThumb(Long blogId, Long userId) {
         return redisTemplate.opsForHash().hasKey(RedisKeyUtil.getUserThumbKey(userId), blogId.toString());
-    }
-    private void unLock(String lockKey, String lockValue) {
-        try {
-            // 使用 Lua 脚本确保释放锁的原子性
-            String script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
-            redisTemplate.execute((RedisCallback<Long>) connection -> connection.eval(script.getBytes(),
-                    ReturnType.INTEGER, 1, lockKey.getBytes(), lockValue.getBytes()));
-        } catch (Exception e) {
-            e.printStackTrace();
-            // 错误处理
-        }
     }
 }
 

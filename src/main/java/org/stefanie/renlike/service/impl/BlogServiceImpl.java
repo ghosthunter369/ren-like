@@ -39,6 +39,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog>
     @Lazy
     private ThumbService thumbService;
     @Resource
+    @Lazy
     private BlogService blogService;
     @Resource
     private RedisTemplate redisTemplate;
